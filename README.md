@@ -11,8 +11,14 @@ Single file, Python 3.11+, no dependencies.
 
 ## Installation
 
+- Clone
 ```bash
 sh -c 'git clone https://github.com/nnra6864/declarative-ddns "${XDG_DATA_HOME:-$HOME/.local/share}/declarative-ddns" && cd "${XDG_DATA_HOME:-$HOME/.local/share}/declarative-ddns"'
+```
+
+- Link
+```bash
+sh -c 'ln -s "${XDG_DATA_HOME:-$HOME/.local/share}/declarative-ddns/declarative-ddns" "${XDG_HOME:-$HOME/.local}/bin/declarative-ddns"'
 ```
 
 The first run creates everything it needs and tells you what to do next:
