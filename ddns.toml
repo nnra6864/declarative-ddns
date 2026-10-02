@@ -1,0 +1,38 @@
+# ddns.toml: safe to commit. Contains NO credentials.
+#
+# - address = "auto"  -> follows your current public IP (A = IPv4, AAAA = IPv6)
+# - "{domain}"        -> expands to the domain of the table it's in
+# - name = "@"        -> the domain apex; otherwise just the subdomain part ("home", "git.lab")
+# - ttl               -> per-record override; falls back to [settings] ttl
+# - Any field Spaceship's API accepts can be used as-is, so MX/TXT/etc. work with no script changes:
+#       MX  = [ { name = "@", exchange = "mail.{domain}", preference = 10 } ]
+#       TXT = [ { name = "@", value = "v=spf1 -all" } ]
+#
+# Ownership rule: for each (type, name) pair listed here, this file is the source of truth.
+# Other records with the same type+name are removed. Pairs not listed are never touched.
+
+[settings]
+ttl = 300
+# ip4_urls = ["https://api.ipify.org"]       # override IP lookup services if you like
+# ip6_urls = ["https://api6.ipify.org"]
+
+[domains."nnstdios.com"]
+A = [
+  { name = "@",    address = "auto" },
+  { name = "home", address = "auto" },
+]
+CNAME = [
+  { name = "www", cname = "{domain}" },
+  { name = "git", cname = "home.{domain}" },
+]
+CAA = [
+  { name = "@", flag = 0, tag = "issue",     value = "letsencrypt.org" },
+  { name = "@", flag = 0, tag = "issuewild", value = "letsencrypt.org" },
+]
+SRV = [
+  { name = "@", service = "_minecraft", protocol = "_tcp", priority = 0, weight = 5, port = 25565, target = "home.{domain}" },
+]
+
+# Second domain: same format, no retyping of the domain anywhere.
+# [domains."example.org"]
+# A = [ { name = "@", address = "auto" } ]
