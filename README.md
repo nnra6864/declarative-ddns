@@ -1,7 +1,7 @@
 # declarative-ddns
 
 > [!WARNING]
-> This was made with 2 promtps to Claude Sonnet 5.5 Medium.
+> This was made with 2 promtps to Claude Sonnet 5.5 Medium.<br>
 > It's made for personal use only, so don't expect any kind of support.
 
 Declarative DNS records for [Spaceship.com](https://www.spaceship.com), with dynamic public-IP support.
