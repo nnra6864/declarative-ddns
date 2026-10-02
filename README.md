@@ -4,10 +4,10 @@
 > This was made with 2 promtps to Claude Sonnet 5.5 Medium.<br>
 > It's made for personal use only, so don't expect any kind of support.
 
-Declarative DNS records for [Spaceship.com](https://www.spaceship.com), with dynamic public-IP support.
-Define your records once in a TOML file, grouped by domain.
-Any record set to `address = "auto"` follows your current public IP.
-Single file, Python 3.11+, no dependencies.
+Declarative DNS records for [Spaceship.com](https://www.spaceship.com), with dynamic public-IP support.<br>
+Define your records once in a TOML file, grouped by domain.<br>
+Any record set to `address = "auto"` follows your current public IP.<br>
+Single file, Python 3.11+, no dependencies.<br>
 
 ## Installation
 
@@ -30,7 +30,7 @@ The first run creates everything it needs and tells you what to do next:
 | systemd units    | `~/.config/systemd/user/declarative-ddns.{service,timer}`         |
 | Command          | `~/.local/bin/declarative-ddns` (symlink to the clone)            |
 
-The clone can live anywhere.
+The clone can live anywhere.<br>
 If you move it, run it once from the new location and the units and symlink are repaired automatically.
 
 ## Usage
@@ -72,5 +72,5 @@ journalctl --user -u declarative-ddns
 
 ## How records are managed
 
-For every (type, name) pair in your config, the config is the source of truth, other records with the same type and name are removed.
+For every (type, name) pair in your config, the config is the source of truth, other records with the same type and name are removed.<br>
 Pairs you never mention, and Spaceship's own non-custom records, are never touched.
