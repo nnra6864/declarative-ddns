@@ -1,9 +1,0 @@
-[Unit]
-Description=Sync Spaceship DNS records and dynamic IP
-
-[Service]
-Type=oneshot
-# Adjust the path to wherever your git repo lives.
-WorkingDirectory=%h/dns
-EnvironmentFile=%h/.config/spaceship-ddns/secrets.env
-ExecStart=/usr/bin/python3 %h/dns/spaceship_ddns.py -c %h/dns/ddns.toml sync --apply

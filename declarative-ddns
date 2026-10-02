@@ -1,0 +1,729 @@
+#!/usr/bin/env python3
+"""
+declarative-ddns: declarative DNS records for Spaceship.com with dynamic public-IP support.
+
+Clone the repo anywhere and run it. On first run it creates everything it needs:
+
+    config   ~/.config/declarative-ddns/config.toml    your records, grouped by domain (safe to commit)
+    secrets  ~/.config/declarative-ddns/secrets.env    API key + secret (git-ignored, chmod 600)
+    units    ~/.config/systemd/user/declarative-ddns.{service,timer}
+    command  ~/.local/bin/declarative-ddns             symlink to this file
+
+(All locations follow $XDG_CONFIG_HOME etc. when set. The install location is detected at
+runtime, so moving the clone just means running it once from the new place.)
+
+Config rules:
+  * address = "auto" on an A/AAAA record follows your current public IP.
+  * "{domain}" in any string expands to the domain the record belongs to.
+  * Any record type/field the Spaceship API accepts works as-is (A, AAAA, CAA, CNAME, MX, SRV, TXT...).
+  * For every (type, name) pair in the config, the config is the source of truth: other records
+    with the same type+name are removed. Pairs the config never mentions are never touched.
+
+Usage:
+    declarative-ddns                    dry run: show what would change
+    declarative-ddns sync --apply       make the changes (the timer runs exactly this)
+    declarative-ddns list DOMAIN        raw JSON of the live records
+    declarative-ddns export DOMAIN      live records as a config.toml snippet (good for bootstrapping)
+    declarative-ddns enable | disable   turn the background timer on / off
+
+Requires Python 3.11+ and nothing else.
+"""
+from __future__ import annotations
+
+import sys
+
+if sys.version_info < (3, 11):
+    sys.exit("declarative-ddns requires Python 3.11 or newer")
+
+import argparse
+import getpass
+import ipaddress
+import json
+import os
+import re
+import shutil
+import subprocess
+import time
+import tomllib
+import urllib.error
+import urllib.parse
+import urllib.request
+from collections import defaultdict
+from pathlib import Path
+
+APP = "declarative-ddns"
+SCRIPT = Path(__file__).resolve()  # real location of this file, wherever it was cloned
+
+API_BASE = os.environ.get("SPACESHIP_API_BASE", "https://spaceship.dev/api/v1")
+RECORD_TYPES = {"A", "AAAA", "ALIAS", "CAA", "CNAME", "HTTPS", "MX", "NS", "PTR", "SRV", "SVCB", "TLSA", "TXT"}
+EXAMPLE_DOMAINS = {"example.com", "example.org", "example.net"}  # reserved: nobody can own these
+DEFAULT_IP4 = ["https://api.ipify.org", "https://ipv4.icanhazip.com", "https://v4.ident.me"]
+DEFAULT_IP6 = ["https://api6.ipify.org", "https://ipv6.icanhazip.com", "https://v6.ident.me"]
+BATCH = 500  # API max items per request
+USER_AGENT = f"{APP}/1.0"
+PLACEHOLDER = "REPLACE_ME"
+API_KEYS_URL = "https://www.spaceship.com/application/api-manager/"
+
+
+# --------------------------------------------------------------------------- paths (XDG, resolved at runtime)
+
+
+def xdg_dir(var: str, fallback: str) -> Path:
+    value = os.environ.get(var, "")
+    return Path(value) if value and os.path.isabs(value) else Path.home() / fallback
+
+
+CONFIG_HOME = xdg_dir("XDG_CONFIG_HOME", ".config")
+STATE_HOME = xdg_dir("XDG_STATE_HOME", ".local/state")
+BIN_DIR = xdg_dir("XDG_BIN_HOME", ".local/bin")
+CONFIG_DIR = CONFIG_HOME / APP
+DEFAULT_CONFIG = CONFIG_DIR / "config.toml"
+DEFAULT_SECRETS = CONFIG_DIR / "secrets.env"
+UNIT_DIR = CONFIG_HOME / "systemd" / "user"
+SERVICE, TIMER = f"{APP}.service", f"{APP}.timer"
+TIMER_MARKER = STATE_HOME / APP / "timer-offered"
+
+
+def log(msg: str = "") -> None:
+    print(msg, flush=True)
+
+
+def die(msg: str, code: int = 1) -> None:
+    print(f"error: {msg}", file=sys.stderr, flush=True)
+    sys.exit(code)
+
+
+# --------------------------------------------------------------------------- templates
+
+CONFIG_TEMPLATE = """\
+# declarative-ddns config. Contains NO credentials, so it is safe to put in version control.
+#
+# This file was generated with example data. example.com / example.org are reserved domains
+# and are skipped, so replace them with your own. Tip: once your API key is in secrets.env,
+#     declarative-ddns export yourdomain.com
+# prints your current records in this format.
+#
+#   address = "auto"  -> follows your current public IP (A = IPv4, AAAA = IPv6)
+#   "{domain}"        -> expands to the domain of the table the record is in
+#   name = "@"        -> the domain apex; otherwise just the subdomain part ("home", "git.lab")
+#   ttl               -> optional per-record override; falls back to [settings] ttl
+#
+# Any field Spaceship's API accepts can be used as-is, so other types need no code changes:
+#   MX  = [ { name = "@", exchange = "mail.{domain}", preference = 10 } ]
+#   TXT = [ { name = "@", value = "v=spf1 -all" } ]
+#
+# Ownership: for each (type, name) pair listed here, this file is the source of truth, and other
+# records with the same type+name are removed. Pairs not listed are never touched.
+
+[settings]
+ttl = 300               # default TTL in seconds
+interval_minutes = 5    # how often the background timer checks your IP
+auto_enable_timer = true  # enable the timer after your first successful `sync --apply`
+# ip4_urls = ["https://api.ipify.org"]    # override the public-IP lookup services
+# ip6_urls = ["https://api6.ipify.org"]
+
+[domains."example.com"]
+A = [
+  { name = "@",    address = "auto" },
+  { name = "home", address = "auto" },
+]
+CNAME = [
+  { name = "www", cname = "{domain}" },
+  { name = "vpn", cname = "home.{domain}" },
+]
+CAA = [
+  { name = "@", flag = 0, tag = "issue", value = "letsencrypt.org" },
+]
+SRV = [
+  { name = "@", service = "_minecraft", protocol = "_tcp", priority = 0, weight = 5, port = 25565, target = "home.{domain}" },
+]
+
+# A second domain uses the same format, and you never retype the domain name:
+[domains."example.org"]
+A = [ { name = "@", address = "auto" } ]
+"""
+
+SECRETS_TEMPLATE = f"""\
+# declarative-ddns API credentials. Keep this file private: it is chmod 600 and git-ignored.
+# Create a key at {API_KEYS_URL}
+# Permissions needed: dnsrecords:read and dnsrecords:write (nothing else).
+SPACESHIP_API_KEY={PLACEHOLDER}
+SPACESHIP_API_SECRET={PLACEHOLDER}
+"""
+
+
+# --------------------------------------------------------------------------- bootstrap
+
+
+def write_new(path: Path, text: str, mode: int = 0o644) -> bool:
+    """Create path with text unless it already exists. Returns True if created."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+    except FileExistsError:
+        return False
+    with os.fdopen(fd, "w") as f:
+        f.write(text)
+    return True
+
+
+def ensure_gitignore(secrets: Path) -> None:
+    """So `git init` in the config dir can never commit the credentials."""
+    gi = secrets.parent / ".gitignore"
+    lines = gi.read_text().splitlines() if gi.exists() else []
+    missing = [l for l in (secrets.name, "*.env") if l not in lines]
+    if missing:
+        header = [] if lines else ["# Keep credentials out of version control"]
+        gi.write_text("\n".join(lines + header + missing) + "\n")
+
+
+def unit_quote(s: str) -> str:
+    """Quote one ExecStart= word per systemd rules."""
+    needs = bool(re.search(r"[\s\"'\\;$%]", s))
+    s = s.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%").replace("$", "$$")
+    return f'"{s}"' if needs else s
+
+
+def render_service(args) -> str:
+    argv = [str(SCRIPT)] if os.access(SCRIPT, os.X_OK) else [sys.executable, str(SCRIPT)]
+    if Path(args.config) != DEFAULT_CONFIG:
+        argv += ["--config", str(Path(args.config).resolve())]
+    if Path(args.secrets_file) != DEFAULT_SECRETS:
+        argv += ["--secrets-file", str(Path(args.secrets_file).resolve())]
+    argv += ["--scheduled", "sync", "--apply"]
+    exec_start = " ".join(unit_quote(a) for a in argv)
+    return (
+        f"# Managed by {APP} and regenerated automatically. Edit config.toml instead.\n"
+        f"[Unit]\nDescription={APP}: sync Spaceship DNS records to the current public IP\n\n"
+        f"[Service]\nType=oneshot\nExecStart={exec_start}\n"
+    )
+
+
+def render_timer(interval: int) -> str:
+    return (
+        f"# Managed by {APP} and regenerated automatically. Edit config.toml instead.\n"
+        f"[Unit]\nDescription=Run {APP} every {interval} minute(s)\n\n"
+        f"[Timer]\nOnStartupSec=1min\nOnUnitActiveSec={interval}min\n\n"
+        f"[Install]\nWantedBy=timers.target\n"
+    )
+
+
+def configured_interval(config: Path) -> int:
+    try:
+        with config.open("rb") as f:
+            value = int(tomllib.load(f).get("settings", {}).get("interval_minutes", 5))
+    except Exception:
+        return 5
+    return min(max(value, 1), 1440)
+
+
+def systemctl(*args: str) -> tuple[int, str]:
+    try:
+        r = subprocess.run(["systemctl", "--user", *args], capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return 1, str(e)
+    return r.returncode, (r.stdout + r.stderr).strip()
+
+
+def ensure_units(args, interval: int) -> list[str]:
+    """Write/refresh the user units (also fixes the path if the clone was moved)."""
+    if not shutil.which("systemctl"):
+        return []
+    wanted = {SERVICE: render_service(args), TIMER: render_timer(interval)}
+    changed: list[str] = []
+    try:
+        UNIT_DIR.mkdir(parents=True, exist_ok=True)
+        for name, text in wanted.items():
+            path = UNIT_DIR / name
+            if not path.exists() or path.read_text() != text:
+                path.write_text(text)
+                changed.append(f"wrote {path}")
+    except OSError as e:
+        return [f"could not write systemd units: {e}"]
+    if changed:
+        systemctl("daemon-reload")
+    return changed
+
+
+def ensure_symlink() -> str | None:
+    """~/.local/bin/declarative-ddns -> this file, so the command works from anywhere."""
+    link = BIN_DIR / APP
+    try:
+        if link.is_symlink():
+            if link.resolve() == SCRIPT or link.exists():
+                return None  # already correct, or points at another working install: leave it
+            link.unlink()  # dangling (e.g. the clone moved): replace
+        elif link.exists():
+            return None
+        if not os.access(SCRIPT, os.X_OK):
+            SCRIPT.chmod(SCRIPT.stat().st_mode | 0o100)
+        BIN_DIR.mkdir(parents=True, exist_ok=True)
+        link.symlink_to(SCRIPT)
+    except OSError:
+        return None
+    note = f"linked {link} -> {SCRIPT}"
+    if str(BIN_DIR) not in os.environ.get("PATH", "").split(os.pathsep):
+        note += f"\n  (note: {BIN_DIR} is not in your PATH; add it to your shell profile to use `{APP}` directly)"
+    return note
+
+
+def bootstrap(args) -> tuple[list[tuple[Path, str]], list[str]]:
+    """Create anything missing. Returns (core files newly created, other notes)."""
+    core: list[tuple[Path, str]] = []
+    notes: list[str] = []
+    cfg, sec = Path(args.config), Path(args.secrets_file)
+    if write_new(cfg, CONFIG_TEMPLATE):
+        core.append((cfg, "your DNS records (edit this)"))
+    if write_new(sec, SECRETS_TEMPLATE, 0o600):
+        core.append((sec, "Spaceship API key + secret (private, chmod 600)"))
+        ensure_gitignore(sec)
+    notes += ensure_units(args, configured_interval(cfg))
+    link = ensure_symlink()
+    if link:
+        notes.append(link)
+    return core, notes
+
+
+def print_first_run(core, notes) -> None:
+    invoke = APP if shutil.which(APP) else str(SCRIPT)
+    log(f"{APP}: first-run setup done.\n")
+    log("Created:")
+    for path, what in core:
+        log(f"  {path}\n      {what}")
+    for n in notes:
+        log(f"  {n}")
+    log(
+        f"""
+Next:
+  1. Create an API key at {API_KEYS_URL}
+     (permissions: dnsrecords:read + dnsrecords:write) and paste it into the secrets file.
+  2. Put your own domains in the config. To see your current records in config format:
+         {invoke} export yourdomain.com
+  3. Preview with `{invoke}`, then apply with `{invoke} sync --apply`.
+     After the first successful apply, a systemd timer keeps your IP up to date automatically.
+
+Tip: {core[0][0].parent if core else CONFIG_DIR} is safe to `git init`; the secrets file is git-ignored."""
+    )
+
+
+# --------------------------------------------------------------------------- timer management
+
+
+def timer_enabled() -> bool:
+    return systemctl("is-enabled", TIMER)[0] == 0
+
+
+def touch_marker() -> None:
+    try:
+        TIMER_MARKER.parent.mkdir(parents=True, exist_ok=True)
+        TIMER_MARKER.touch()
+    except OSError:
+        pass
+
+
+def ensure_linger() -> None:
+    """Without lingering, user timers stop when you log out."""
+    if not shutil.which("loginctl"):
+        return
+    user = getpass.getuser()
+    try:
+        r = subprocess.run(["loginctl", "show-user", user, "-p", "Linger", "--value"],
+                           capture_output=True, text=True, timeout=15)
+        if r.stdout.strip() == "yes":
+            return
+        r = subprocess.run(["loginctl", "enable-linger", user], capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.TimeoutExpired):
+        return
+    if r.returncode == 0:
+        log("enabled lingering so updates keep running while you're logged out")
+    else:
+        log(f"note: couldn't enable lingering; for updates while logged out run: sudo loginctl enable-linger {user}")
+
+
+def enable_timer() -> bool:
+    if not shutil.which("systemctl"):
+        log("systemctl not found; schedule `declarative-ddns --scheduled sync --apply` with cron or your init system.")
+        return False
+    code, out = systemctl("enable", "--now", TIMER)
+    if code != 0:
+        log(f"could not enable the timer: {out}\nTry again later with: {APP} enable")
+        return False
+    log(f"timer enabled: {APP} now runs in the background (turn off with `{APP} disable`)")
+    ensure_linger()
+    return True
+
+
+def maybe_auto_enable(settings: dict) -> None:
+    """After the first fully successful apply, offer the timer exactly once."""
+    if TIMER_MARKER.exists() or not settings.get("auto_enable_timer", True):
+        return
+    touch_marker()
+    if not shutil.which("systemctl") or timer_enabled():
+        return
+    log("first successful sync: enabling the background timer")
+    enable_timer()
+
+
+# --------------------------------------------------------------------------- secrets
+
+
+def load_credentials(path: Path) -> dict[str, str]:
+    """Environment variables win; otherwise read KEY=VALUE lines from the secrets file."""
+    if path.exists():
+        if path.stat().st_mode & 0o077:
+            log(f"warning: {path} is readable by other users; run: chmod 600 {path}")
+        for line in path.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+    key, secret = os.environ.get("SPACESHIP_API_KEY", ""), os.environ.get("SPACESHIP_API_SECRET", "")
+    if not key or not secret or PLACEHOLDER in (key, secret):
+        die(f"API credentials are not set. Put your key and secret in {path}\n"
+            f"       (create one at {API_KEYS_URL}; needs dnsrecords:read + dnsrecords:write)")
+    return {"X-API-Key": key, "X-API-Secret": secret}
+
+
+# --------------------------------------------------------------------------- API
+
+
+class ApiError(Exception):
+    def __init__(self, status: int, detail: str):
+        super().__init__(f"HTTP {status}: {detail.strip()[:500]}")
+        self.status = status
+
+
+def api(creds: dict, method: str, path: str, body=None, query: dict | None = None):
+    url = API_BASE + path
+    if query:
+        url += "?" + urllib.parse.urlencode(query)
+    data = json.dumps(body).encode() if body is not None else None
+    headers = {**creds, "Content-Type": "application/json", "Accept": "application/json", "User-Agent": USER_AGENT}
+    for attempt in range(3):
+        req = urllib.request.Request(url, data=data, method=method, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                raw = resp.read()
+                return json.loads(raw) if raw else None
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode(errors="replace")
+            if e.code == 429 and attempt < 2:
+                try:
+                    wait = int(e.headers.get("Retry-After", "5"))
+                except ValueError:
+                    wait = 5
+                time.sleep(min(max(wait, 1), 60))
+                continue
+            raise ApiError(e.code, detail) from None
+        except urllib.error.URLError as e:
+            raise ApiError(0, f"network error: {e.reason}") from None
+    raise ApiError(429, "rate limited")
+
+
+def get_records(creds: dict, domain: str) -> list[dict]:
+    """All records in the 'custom' group (the ones the API lets us manage)."""
+    items: list[dict] = []
+    skip = 0
+    while True:
+        page = api(creds, "GET", f"/dns/records/{domain}", query={"take": BATCH, "skip": skip})
+        batch = page.get("items", [])
+        items += batch
+        skip += len(batch)
+        if not batch or skip >= page.get("total", skip):
+            break
+    return [r for r in items if (r.get("group") or {}).get("type", "custom") == "custom"]
+
+
+# --------------------------------------------------------------------------- public IP
+
+
+class PublicIP:
+    def __init__(self, settings: dict):
+        self.urls = {4: settings.get("ip4_urls", DEFAULT_IP4), 6: settings.get("ip6_urls", DEFAULT_IP6)}
+        self.cache: dict[int, str | None] = {}
+
+    def get(self, version: int) -> str | None:
+        if version not in self.cache:
+            self.cache[version] = self._detect(version)
+        return self.cache[version]
+
+    def _detect(self, version: int) -> str | None:
+        for url in self.urls[version]:
+            try:
+                req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    ip = ipaddress.ip_address(resp.read().decode().strip())
+                if ip.version == version:
+                    return str(ip)
+            except Exception:
+                continue
+        return None
+
+
+# --------------------------------------------------------------------------- record logic
+
+
+def expand(value, domain: str):
+    if isinstance(value, str):
+        return value.replace("{domain}", domain)
+    return value
+
+
+def rkey(rec: dict) -> tuple[str, str]:
+    return rec["type"].upper(), rec["name"].lower()
+
+
+def norm(key: str, value, rtype: str) -> str:
+    if key == "port":
+        return str(value).lstrip("_")
+    if isinstance(value, str):
+        if rtype == "TXT" and key == "value":
+            return value  # TXT is case-sensitive
+        return value.lower().rstrip(".")
+    return str(value)
+
+
+def matches(want: dict, have: dict) -> bool:
+    """Same record, ignoring TTL (a TTL difference is an update, not a different record)."""
+    for k, v in want.items():
+        if k == "ttl":
+            continue
+        if k not in have or norm(k, v, want["type"]) != norm(k, have[k], want["type"]):
+            return False
+    return True
+
+
+def describe(rec: dict) -> str:
+    data = " ".join(f"{k}={v}" for k, v in rec.items() if k not in ("type", "name", "ttl", "group"))
+    ttl = f" (ttl {rec['ttl']})" if "ttl" in rec else ""
+    return f"{rec['type']:<5} {rec['name']:<20} {data}{ttl}"
+
+
+def build_desired(domain: str, dcfg: dict, ttl_default: int, ips: PublicIP) -> tuple[list[dict], int]:
+    """Turn one [domains."x"] table into API-shaped records. Returns (records, problem_count)."""
+    out: list[dict] = []
+    problems = 0
+    for rtype, entries in dcfg.items():
+        if rtype not in RECORD_TYPES:
+            die(f"[{domain}] unknown record type '{rtype}' (valid: {', '.join(sorted(RECORD_TYPES))})")
+        if not isinstance(entries, list):
+            die(f"[{domain}] {rtype} must be an array of tables")
+        for i, entry in enumerate(entries):
+            if "name" not in entry:
+                die(f"[{domain}] {rtype}[{i}] is missing 'name'")
+            rec = {"type": rtype, **{k: expand(v, domain) for k, v in entry.items()}}
+            rec.setdefault("ttl", ttl_default)
+            if rtype in ("A", "AAAA") and rec.get("address") == "auto":
+                version = 4 if rtype == "A" else 6
+                ip = ips.get(version)
+                if ip is None:
+                    log(f"[{domain}] warning: could not detect public IPv{version}; skipping {rtype} '{rec['name']}'")
+                    if version == 4:
+                        problems += 1
+                    continue
+                rec["address"] = ip
+            out.append(rec)
+    return out, problems
+
+
+def chunks(seq: list, n: int):
+    for i in range(0, len(seq), n):
+        yield seq[i : i + n]
+
+
+def sync_domain(creds, domain, dcfg, ttl_default, ips, *, apply: bool, force: bool, prune: bool) -> int:
+    desired, problems = build_desired(domain, dcfg, ttl_default, ips)
+    existing = get_records(creds, domain)
+
+    have_by_key: dict = defaultdict(list)
+    for e in existing:
+        have_by_key[rkey(e)].append(e)
+    want_by_key: dict = defaultdict(list)
+    for w in desired:
+        want_by_key[rkey(w)].append(w)
+
+    adds: list[tuple[str, dict]] = []  # ("+" new | "~" ttl change, record)
+    deletes: list[dict] = []
+    for key, wants in want_by_key.items():
+        haves = have_by_key.get(key, [])
+        for w in wants:
+            m = next((e for e in haves if matches(w, e)), None)
+            if m is None:
+                adds.append(("+", w))
+            elif m.get("ttl") != w["ttl"]:
+                adds.append(("~", w))
+        if prune:
+            deletes += [e for e in haves if not any(matches(w, e) for w in wants)]
+
+    if not adds and not deletes:
+        log(f"[{domain}] up to date")
+        return problems
+
+    for e in deletes:
+        log(f"[{domain}] - {describe(e)}")
+    for sign, w in adds:
+        log(f"[{domain}] {sign} {describe(w)}")
+    if not apply:
+        log(f"[{domain}] dry run: nothing changed (use `sync --apply`)")
+        return problems
+
+    # Delete first: single-valued types (CNAME) would conflict otherwise, and a stale
+    # A record points at an IP that's no longer ours anyway.
+    stale = [{k: v for k, v in e.items() if k not in ("ttl", "group")} for e in deletes]
+    for batch in chunks(stale, BATCH):
+        api(creds, "DELETE", f"/dns/records/{domain}", body=batch)
+    new = [w for _, w in adds]
+    for batch in chunks(new, BATCH):
+        payload = {"items": batch}
+        if force:
+            payload["force"] = True
+        api(creds, "PUT", f"/dns/records/{domain}", body=payload)
+    log(f"[{domain}] applied: {len(deletes)} removed, {len(new)} added/updated")
+    return problems
+
+
+# --------------------------------------------------------------------------- commands
+
+
+def load_config(path: Path) -> dict:
+    if not path.exists():
+        die(f"config not found: {path} (run `{APP}` without --scheduled once to create it)")
+    try:
+        with path.open("rb") as f:
+            return tomllib.load(f)
+    except tomllib.TOMLDecodeError as e:
+        die(f"{path}: {e}")
+    return {}
+
+
+def cmd_sync(args, creds) -> int:
+    cfg = load_config(Path(args.config))
+    settings = cfg.get("settings", {})
+    ttl_default = int(settings.get("ttl", 300))
+    domains = cfg.get("domains", {})
+    if args.domain:
+        if args.domain not in domains:
+            die(f"domain '{args.domain}' is not in the config")
+        domains = {args.domain: domains[args.domain]}
+    real = {d: c for d, c in domains.items() if d.lower() not in EXAMPLE_DOMAINS}
+    if not real:
+        die(f"{args.config} only contains the example domains. Edit it to list your own.\n"
+            f"       Tip: `{APP} export yourdomain.com` prints your current records in config format.")
+    for d in domains.keys() - real.keys():
+        log(f"[{d}] skipping example domain")
+    ips = PublicIP(settings)
+    failures = 0
+    for domain, dcfg in real.items():
+        try:
+            failures += sync_domain(creds, domain, dcfg, ttl_default, ips,
+                                    apply=args.apply, force=args.force, prune=not args.no_prune)
+        except ApiError as e:
+            print(f"[{domain}] API error: {e}", file=sys.stderr, flush=True)
+            if e.status == 422 and not args.force:
+                print(f"[{domain}] hint: a conflicting record exists; fix it or retry with --force", file=sys.stderr)
+            failures += 1
+    if args.apply and not failures and not args.domain and not args.scheduled:
+        maybe_auto_enable(settings)
+    return 1 if failures else 0
+
+
+def cmd_list(args, creds) -> int:
+    print(json.dumps(get_records(creds, args.domain), indent=2))
+    return 0
+
+
+def toml_val(v) -> str:
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, (int, float)):
+        return str(v)
+    return json.dumps(str(v))  # JSON string escapes are valid TOML basic strings
+
+
+def cmd_export(args, creds) -> int:
+    domain = args.domain
+    by_type: dict = defaultdict(list)
+    for r in get_records(creds, domain):
+        by_type[r["type"]].append(r)
+    print('# Generated from live records. Change dynamic addresses to "auto" before syncing.')
+    print(f'[domains."{domain}"]')
+    for rtype in sorted(by_type):
+        print(f"{rtype} = [")
+        for r in by_type[rtype]:
+            fields = {k: v for k, v in r.items() if k not in ("type", "group")}
+            ordered = ["name"] + [k for k in fields if k not in ("name", "ttl")] + (["ttl"] if "ttl" in fields else [])
+            parts = []
+            for k in ordered:
+                v = fields[k]
+                if isinstance(v, str) and k != "name" and not (rtype == "TXT" and k == "value"):
+                    if v.lower() == domain:
+                        v = "{domain}"
+                    elif v.lower().endswith("." + domain):
+                        v = v[: -len(domain)] + "{domain}"
+                parts.append(f"{k} = {toml_val(v)}")
+            print("  { " + ", ".join(parts) + " },")
+        print("]")
+    return 0
+
+
+def cmd_enable(args, creds) -> int:
+    touch_marker()  # an explicit choice, so never auto-toggle afterwards
+    return 0 if enable_timer() else 1
+
+
+def cmd_disable(args, creds) -> int:
+    touch_marker()
+    if not shutil.which("systemctl"):
+        die("systemctl not found")
+    code, out = systemctl("disable", "--now", TIMER)
+    if code != 0:
+        die(f"could not disable the timer: {out}")
+    log("timer disabled")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog=APP, description="Declarative DNS + dynamic IP for Spaceship.com")
+    p.add_argument("-c", "--config", default=str(DEFAULT_CONFIG), help=f"config file (default: {DEFAULT_CONFIG})")
+    p.add_argument("--secrets-file", default=str(DEFAULT_SECRETS), help=f"credentials file (default: {DEFAULT_SECRETS})")
+    p.add_argument("--scheduled", action="store_true", help=argparse.SUPPRESS)  # set by the systemd unit
+    # No subcommand = dry-run sync.
+    p.set_defaults(fn=cmd_sync, needs_creds=True, apply=False, domain=None, no_prune=False, force=False)
+    sub = p.add_subparsers(dest="cmd")
+
+    s = sub.add_parser("sync", help="make Spaceship match the config (dry run unless --apply)")
+    s.add_argument("--apply", action="store_true", help="actually make changes")
+    s.add_argument("--domain", help="only sync this domain")
+    s.add_argument("--no-prune", action="store_true", help="never delete records, only add/update")
+    s.add_argument("--force", action="store_true", help="pass force=true to the API (overrides conflict checks)")
+    s.set_defaults(fn=cmd_sync, needs_creds=True)
+
+    l = sub.add_parser("list", help="print live records as raw JSON")
+    l.add_argument("domain")
+    l.set_defaults(fn=cmd_list, needs_creds=True)
+
+    e = sub.add_parser("export", help="print live records as a config.toml snippet")
+    e.add_argument("domain")
+    e.set_defaults(fn=cmd_export, needs_creds=True)
+
+    sub.add_parser("enable", help="enable the background timer").set_defaults(fn=cmd_enable, needs_creds=False)
+    sub.add_parser("disable", help="disable the background timer").set_defaults(fn=cmd_disable, needs_creds=False)
+    return p
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    if not args.scheduled:  # the timer-run never touches the filesystem layout
+        core, notes = bootstrap(args)
+        if core and args.needs_creds:
+            print_first_run(core, notes)
+            return 0
+        for n in notes:
+            log(n)
+    creds = load_credentials(Path(args.secrets_file)) if args.needs_creds else {}
+    return args.fn(args, creds)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
